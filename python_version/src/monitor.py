@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 APPLE_URL = "https://www.apple.com/jp/shop/refurbished/mac/mac-mini"
-INVENTORY_FILE = Path("inventory.json")
+INVENTORY_FILE = Path("../inventory.json")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 if not DISCORD_WEBHOOK_URL:
