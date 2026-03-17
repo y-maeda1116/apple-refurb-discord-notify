@@ -51,20 +51,27 @@ Monitor Apple's refurbished products page and send Discord notifications when Ma
 **Data Structures:**
 
 ```python
-# Product from Apple API
+# Normalized internal product representation (parsed from Apple API response)
 {
     "name": "Mac mini M4",
     "price": "¥120,000",
+    "price_raw": 120000,  # int for comparison
     "url": "https://apple.com/jp/...",
-    "ram": "24GB"
+    "ram": "24GB",
+    "ram_gb": 24,  # int for comparison
+    "chip": "M4",
+    "thumbnail": "https://store.storeimages.cdn-apple.com/..."
 }
 
-# inventory.json format
+# inventory.json format (tracked in git)
 {
   "products": {
-    "mac_mini_m4_24gb": {
+    "mac_mini_m4_24gb_120000": {
       "name": "Mac mini M4",
       "ram": "24GB",
+      "ram_gb": 24,
+      "price": "¥120,000",
+      "price_raw": 120000,
       "first_notified": "2026-03-17T10:00:00Z",
       "last_notified": "2026-03-17T10:00:00Z",
       "in_stock": true
@@ -72,6 +79,17 @@ Monitor Apple's refurbished products page and send Discord notifications when Ma
   },
   "last_fetch": "2026-03-17T10:00:00Z"
 }
+```
+
+**Unique ID Generation:**
+```python
+import hashlib
+
+def generate_unique_id(product):
+    """Generate unique ID from name, RAM, and price."""
+    key = f"{product['name']}_{product['ram_gb']}_{product['price_raw']}"
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+    # Result example: "mac_mini_m4_24gb_120000" (shortened for readability)
 ```
 
 ## Data Flow
@@ -109,6 +127,36 @@ Monitor Apple's refurbished products page and send Discord notifications when Ma
       │   ├─ git commit -m "chore: update inventory [skip ci]"
       │   └─ git push
       └─ If no changes: nothing
+```
+
+## RAM Extraction Logic
+
+```python
+import re
+
+def extract_ram(product):
+    """Extract RAM value in GB from product data.
+
+    Tries multiple patterns:
+    - Structured data: product['parts']['dimensionsCapacity']['ram']
+    - Text parsing: "24GB 統合メモリ", "32GB", etc.
+    """
+    # Try structured data first
+    if 'parts' in product:
+        ram_str = product['parts']['dimensionsCapacity'].get('ram', '')
+        match = re.search(r'(\d+)', str(ram_str))
+        if match:
+            return int(match.group(1))
+
+    # Fallback to regex on name or description
+    patterns = [r'(\d+)GB', r'(\d+) GB', r'(\d+)ギガバイト']
+    text = product.get('name', '') + str(product.get('description', ''))
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return int(match.group(1))
+
+    raise ValueError(f"Could not extract RAM from: {product}")
 ```
 
 ## Restock Detection Logic
@@ -170,7 +218,7 @@ for product in filtered_products:
       },
       {
         "name": "🔁 状態",
-        "value": "再入庫 🆕",
+        "value": "新着 🆕",  // or "再入庫 🆕" for restocks
         "inline": true
       }
     ],
@@ -182,7 +230,9 @@ for product in filtered_products:
 ```
 
 - Color: Apple Green (#589632)
-- Status field: "新着" for new, "再入庫 🆕" for restocks
+- Status field values:
+  - New product: `"新着 🆕"`
+  - Restocked product: `"再入庫 🆕"`
 - Footer includes notification timestamp
 
 ## GitHub Actions Configuration
@@ -194,6 +244,9 @@ on:
   schedule:
     - cron: '*/15 * * * *'
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   monitor:
@@ -248,6 +301,26 @@ apple-refurb-discord-notify/
 requests==2.31.0
 ```
 
+## Logging Strategy
+
+Use Python's standard `logging` module for consistent output:
+
+```python
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+logger = logging.getLogger(__name__)
+```
+
+Log levels:
+- INFO: Successful operations (fetch, notify, commit)
+- WARNING: Non-critical issues (webhook retry, parse warnings)
+- ERROR: Failures that require attention (API errors, etc.)
+
 ## Filtering Criteria
 
 1. Product name contains "Mac mini"
@@ -273,6 +346,13 @@ python src/monitor.py  # Test duplicate prevention
 1. Set `DISCORD_WEBHOOK_URL` in GitHub Secrets
 2. Push `.github/workflows/monitor.yml`
 3. Verify execution in Actions tab
+
+## inventory.json Growth Management
+
+Note: The inventory.json file will grow over time as new products are tracked. For this use case, growth is expected and manageable:
+- Apple typically has 5-20 Mac mini models at any time
+- File size remains small (few KB) even with years of data
+- If pruning is needed later, add a `max_products` limit or `age_days` threshold
 
 ## Requirements Summary
 
