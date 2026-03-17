@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 # Configuration
-APPLE_API_URL = "https://www.apple.com/jp/shop/refurbished/ajax/mac/mac-mini"
+APPLE_URL = "https://www.apple.com/jp/shop/refurbished/mac/mac-mini"
 INVENTORY_FILE = Path("inventory.json")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
@@ -37,35 +37,37 @@ if not DISCORD_WEBHOOK_URL:
 
 
 def fetch_products() -> list[dict]:
-    """Fetch products from Apple's refurbished API.
+    """Fetch products from Apple's refurbished page by parsing HTML.
 
     Returns:
         List of product dictionaries from Apple API.
 
     Raises:
         requests.RequestException: If API request fails.
-        json.JSONDecodeError: If response is not valid JSON.
     """
-    logger.info(f"Fetching products from {APPLE_API_URL}")
+    logger.info(f"Fetching products from {APPLE_URL}")
 
     try:
-        response = requests.get(APPLE_API_URL, timeout=30)
+        response = requests.get(APPLE_URL, timeout=30)
         response.raise_for_status()
-        data = response.json()
+        html = response.text
 
-        # Apple API response structure varies - parse accordingly
-        if isinstance(data, dict) and "products" in data:
-            products = data["products"]
-        elif isinstance(data, list):
-            products = data
-        elif isinstance(data, dict) and "content" in data:
-            # Some responses have nested content
-            products = data["content"].get("productTileData", {}).get("tiles", [])
-        else:
-            logger.warning(f"Unexpected API response structure: {type(data)}")
-            products = []
+        # Extract products array from embedded JSON
+        pattern = r'products"\s*:\s*(\[[^\]]+(?:\[[^\]]*\][^\]]*)*\])'
+        match = re.search(pattern, html)
 
-        logger.info(f"Fetched {len(products)} products from Apple API")
+        if not match:
+            logger.warning("Could not find products data in HTML")
+            return []
+
+        products_json = match.group(1)
+        
+        # Fix JSON syntax (JavaScript to Python)
+        products_json = re.sub(r'(\w+)\s*:', r'"\1":', products_json)
+        products_json = re.sub(r"'", r'"', products_json)
+        
+        products = json.loads(products_json)
+        logger.info(f"Fetched {len(products)} products from Apple")
         return products
 
     except requests.RequestException as e:
@@ -79,57 +81,37 @@ def fetch_products() -> list[dict]:
 def extract_ram(product: dict) -> int | None:
     """Extract RAM value in GB from product data.
 
-    Tries multiple patterns:
-    - Structured data: product['parts']['dimensionsCapacity']['ram']
-    - Text parsing: "24GB 統合メモリ", "32GB", etc.
-
     Args:
         product: Product dictionary from Apple API.
 
     Returns:
         RAM value in GB, or None if not found.
     """
-    # Try structured data first
-    if 'parts' in product:
-        try:
-            ram_str = str(product['parts']['dimensionsCapacity'].get('ram', ''))
-            match = re.search(r'(\d+)', ram_str)
-            if match:
-                return int(match.group(1))
-        except (KeyError, TypeError):
-            pass
-
-    # Try other common structured paths
-    for path in ['ram', 'memory', 'memoryCapacity', 'dimensionsCapacity.ram']:
-        keys = path.split('.')
-        value = product
-        for key in keys:
-            if isinstance(value, dict):
-                value = value.get(key)
-                if value is None:
-                    break
-            else:
-                break
-        if value:
-            match = re.search(r'(\d+)', str(value))
-            if match:
-                return int(match.group(1))
-
-    # Fallback to regex on name, title, or description fields
-    patterns = [r'(\d+)GB', r'(\d+) GB', r'(\d+)ギガバイト']
-    text_fields = ['name', 'title', 'shortTitle', 'productName', 'description']
-
-    text = ''
-    for field in text_fields:
-        if field in product:
-            text += str(product[field]) + ' '
-
-    for pattern in patterns:
-        match = re.search(pattern, text)
+    # Try tsMemorySize (Apple's unified memory field)
+    dimensions = product.get('dimensions', {})
+    ram_str = dimensions.get('tsMemorySize', '')
+    
+    if ram_str:
+        match = re.search(r'(\d+)', ram_str.lower())
         if match:
             return int(match.group(1))
 
-    logger.warning(f"Could not extract RAM from product: {product.get('name', 'unknown')}")
+    # Fallback to other fields
+    for field in ['memorySize', 'ram']:
+        if field in dimensions:
+            ram_str = str(dimensions[field])
+            match = re.search(r'(\d+)', ram_str.lower())
+            if match:
+                return int(match.group(1))
+
+    # Try regex on model name
+    model = product.get('dimensions', {}).get('refurbClearModel', '')
+    patterns = [r'(\d+)gb', r'(\d+) gb', r'(\d+)ギガバイト']
+    for pattern in patterns:
+        match = re.search(pattern, model.lower())
+        if match:
+            return int(match.group(1))
+
     return None
 
 
@@ -145,9 +127,11 @@ def filter_products(products: list[dict]) -> list[dict]:
     filtered = []
 
     for product in products:
-        # Check if product name contains "Mac mini"
-        name = product.get('name', product.get('title', product.get('productName', '')))
-        if 'Mac mini' not in name and 'MacMini' not in name:
+        # Check if product is Mac mini
+        dimensions = product.get('dimensions', {})
+        model = dimensions.get('refurbClearModel', '').lower()
+        
+        if 'mini' not in model and 'macmini' not in model:
             continue
 
         # Extract RAM
@@ -155,32 +139,36 @@ def filter_products(products: list[dict]) -> list[dict]:
         if ram_gb is None or ram_gb < 24:
             continue
 
-        # Normalize product data
-        normalized = {
-            "name": name,
-            "price": product.get('price', {}).get('current', {}).get('price', ''),
-            "price_raw": 0,
-            "url": f"https://www.apple.com/jp/shop/refurbished{product.get('productUrl', '')}",
-            "ram": f"{ram_gb}GB",
-            "ram_gb": ram_gb,
-            "chip": "Unknown",
-            "thumbnail": product.get('image', {}).get('src', '')
-        }
+        # Build product URL
+        product_id = product.get('productTile', {}).get('id', '')
+        url = f"{APPLE_URL}?fproduct={product_id}" if product_id else APPLE_URL
 
-        # Parse price to integer
-        price_str = normalized["price"].replace('¥', '').replace(',', '').replace('JPY', '').strip()
+        # Get price
+        price_info = product.get('productTile', {}).get('price', {})
+        current_price = price_info.get('currentPrice', '0')
+        price_str = str(current_price).replace('¥', '').replace(',', '').replace('JPY', '').strip()
+        
         try:
-            normalized["price_raw"] = int(price_str)
-            if normalized["price_raw"] == 0:
-                continue  # Invalid price
+            price_raw = int(float(price_str)) if price_str else 0
+            if price_raw == 0:
+                continue
         except ValueError:
-            logger.warning(f"Could not parse price: {price_str}")
             continue
 
-        # Extract chip name if available
-        chip = product.get('chip', '')
-        if chip:
-            normalized["chip"] = chip
+        # Get chip name from year and model
+        year = dimensions.get('dimensionRelYear', '')
+        chip = f"M{year[-2:]}" if year and len(year) >= 2 else "Unknown"
+
+        normalized = {
+            "name": f"Mac mini {chip}",
+            "price": f"¥{price_raw:,}",
+            "price_raw": price_raw,
+            "url": url,
+            "ram": f"{ram_gb}GB",
+            "ram_gb": ram_gb,
+            "chip": chip,
+            "thumbnail": ""
+        }
 
         filtered.append(normalized)
         logger.info(f"Matched: {normalized['name']} - {normalized['ram']} - {normalized['price']}")
