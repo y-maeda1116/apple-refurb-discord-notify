@@ -60,6 +60,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r python_version/requirements.txt
 
+      - name: Debug - List files
+        run: |
+          pwd
+          ls -R
+
       - name: Run Python monitor (Timed)
         run: time python python_version/monitor.py
 
