@@ -58,15 +58,12 @@ jobs:
           cache-dependency-path: python_version/requirements.txt
 
       - name: Install dependencies
-        run: pip install -r python_version/requirements.txt
-
-      - name: Debug - List files
-        run: |
-          pwd
-          ls -R
+        working-directory: ./python_version
+        run: pip install -r requirements.txt
 
       - name: Run Python monitor (Timed)
-        run: time python python_version/monitor.py
+        working-directory: ./python_version/src
+        run: time python monitor.py
 
       # Python側でも在庫更新をする場合は必要（競合注意）
       - name: Commit inventory changes
